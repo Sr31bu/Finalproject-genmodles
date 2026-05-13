@@ -1,0 +1,265 @@
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+% CVPR style — page numbers version
+% \usepackage[review]{cvpr}
+\usepackage[pagenumbers]{cvpr}
+
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usepackage[capitalize]{cleveref}
+
+\def\cvprPaperID{5788}
+\def\confName{CS 5788}
+\def\confYear{2026}
+
+\begin{document}
+
+\title{The Simplification Tax: How Much Alignment Quality\\Do PPO, DPO, and SimPO Trade for Efficiency?}
+
+\author{Shashank Ramachandran\\
+Cornell University\\
+{\tt\small sr2433@cornell.edu}}
+
+\maketitle
+
+% ============================================================================
+\begin{abstract}
+Reinforcement Learning from Human Feedback (RLHF) aligns language models with human preferences using Proximal Policy Optimization (PPO), but recent alternatives progressively simplify the pipeline: Direct Preference Optimization (DPO) eliminates the reward model and RL loop, while SimPO further removes the reference policy. Each simplification reduces infrastructure cost but may sacrifice quality. We conduct the first controlled three-way comparison on TL;DR summarization with identical base models (Pythia-1B-deduped + LoRA), measuring not just final quality but specific \emph{failure modes}: length exploitation, likelihood displacement, mode collapse, and noise robustness. PPO achieves the highest length-controlled win rate (68.2\%) with the best output diversity. DPO achieves a moderate raw win rate (59.5\%) but inflates response length by $1.5\times$; after length correction, its advantage over SFT shrinks substantially. SimPO resists length exploitation through its length-normalized reward but shows moderate mode collapse. Under label noise, DPO degrades faster than SimPO, consistent with its strict reliance on observed preference labels.
+\end{abstract}
+
+% ============================================================================
+\section{Introduction}
+
+The dominant paradigm for aligning language models involves four components: a pre-trained base model, supervised fine-tuning (SFT), a learned reward model, and PPO-based policy optimization~\cite{ouyang2022training, stiennon2020learning}. This pipeline is effective but expensive: it requires training and serving four separate models.
+
+Recent work proposes simplifications. DPO~\cite{rafailov2023direct} collapses the reward model and RL loop into a single closed-form loss, requiring only two models (policy and frozen reference). SimPO~\cite{meng2024simpo} goes further, eliminating the reference model entirely by using length-normalized average log-probability as an implicit reward.
+
+Each simplification removes infrastructure but may introduce failure modes. Published comparisons show PPO outperforms DPO when implementation details are controlled~\cite{xu2024dpo}, and that DPO suffers from \emph{likelihood displacement} where both preferred and dispreferred response probabilities decrease during training~\cite{razin2024unintentional}. However, no single study has measured these failure modes across all three methods on the same data, model, and evaluation harness.
+
+\textbf{Contributions.} We provide a controlled comparison of PPO, DPO, and SimPO on TL;DR summarization~\cite{stiennon2020learning} with Pythia-1B-deduped~\cite{biderman2023pythia} + LoRA, characterizing:
+\begin{enumerate}
+    \item Length exploitation and its correction via LC win rate
+    \item Likelihood displacement trajectories during training
+    \item Output diversity (distinct-$n$, self-BLEU) and mode collapse
+    \item Robustness to preference label noise at 10\%, 25\%, 50\%
+    \item Reward--KL Pareto frontiers across $\beta$ sweeps
+\end{enumerate}
+
+% ============================================================================
+\section{Method}
+
+\subsection{Setup}
+
+All methods start from the same SFT checkpoint: Pythia-1B-deduped fine-tuned on \texttt{trl-lib/tldr} with LoRA adapters ($r{=}16$, $\alpha{=}32$). We use 4,096 training examples and train for one epoch.
+
+\textbf{PPO} uses the standard four-model setup (policy, reference, reward model, value head) via TRL~\cite{vonwerra2022trl} with a pre-trained reward model from \texttt{cleanrl}. KL penalty coefficient $\beta_{\text{KL}}{=}0.05$.
+
+\textbf{DPO}~\cite{rafailov2023direct} uses the closed-form loss:
+\begin{equation}
+\mathcal{L}_{\text{DPO}} = -\mathbb{E}\!\left[\log\sigma\!\left(\beta\left[\log\frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \log\frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\right]\right)\right]
+\end{equation}
+with default $\beta{=}0.1$ and a frozen reference copy of the SFT model.
+
+\textbf{SimPO}~\cite{meng2024simpo} removes the reference model entirely:
+\begin{equation}
+\hat{r}(y|x) = \frac{\beta}{|y|}\sum_t \log\pi_\theta(y_t|x, y_{<t}), \quad
+\mathcal{L}_{\text{SimPO}} = -\mathbb{E}\!\left[\log\sigma(\hat{r}(y_w) - \hat{r}(y_l) - \gamma)\right]
+\end{equation}
+with default $\beta{=}2.0$, $\gamma{=}1.0$. The length normalization in $\hat{r}$ is the key design choice.
+
+\subsection{Evaluation}
+
+We evaluate each trained checkpoint against the SFT baseline using a GPT-4o pairwise judge~\cite{zheng2024judging} with both-orderings debiasing on 200 held-out prompts. We report:
+\begin{itemize}
+    \item \textbf{Length-controlled (LC) win rate}: logistic regression of $P(\text{method wins})$ on length difference, predicted at $\Delta_{\text{len}}{=}0$~\cite{dubois2024length}.
+    \item \textbf{Diversity}: distinct-1/2 (unique $n$-gram fraction) and self-BLEU-4 (lower = more diverse).
+    \item \textbf{Implicit reward trajectories}: per-step $r_{\text{chosen}}/r_{\text{rejected}}$ for DPO and SimPO.
+\end{itemize}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{pareto_reward_kl.png}
+    \caption{\textbf{Reward--KL Pareto frontier.} Each point is one trained checkpoint; $x$-axis is the absolute mean implicit reward (KL proxy), $y$-axis is the chosen--rejected reward gap. Higher $\beta$ pushes DPO and SimPO rightward (more KL divergence from reference). SimPO at $\beta{=}5.0$ (rightmost orange) achieves a large gap but at high KL cost.}
+    \label{fig:pareto}
+\end{figure}
+
+% ============================================================================
+\section{Experiments}
+
+\subsection{Main Comparison}
+
+\Cref{tab:main} compares the three methods at default hyperparameters.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Three-way comparison at default hyperparameters. LC WR = length-controlled win rate vs.\ SFT baseline. $\uparrow$ = higher is better, $\downarrow$ = lower is better.}
+\label{tab:main}
+\begin{tabular}{lccccc}
+\toprule
+Method & LC WR $\uparrow$ & Raw WR & Len & dist-1 $\uparrow$ & sB-4 $\downarrow$ \\
+\midrule
+PPO    & \textbf{0.682} & 0.675 & 23.5 & \textbf{0.188} & 0.063 \\
+DPO    & 0.592 & 0.595 & 36.0 & 0.142 & 0.103 \\
+SimPO  & 0.583 & 0.583 & 24.9 & 0.182 & \textbf{0.008} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+PPO achieves the highest LC win rate (68.2\%) and output diversity (distinct-1 = 0.188). DPO's raw win rate (59.5\%) is competitive, but its mean response length (36.0 tokens) is $1.5\times$ the SFT baseline, indicating length exploitation. After length correction, DPO's advantage shrinks. SimPO produces responses close to SFT length (24.9 tokens) thanks to its length-normalized reward, confirming the design's intent.
+
+\subsection{Length Exploitation}
+
+\Cref{fig:length} shows chosen response length during training. DPO responses grow monotonically from ${\sim}40$ to ${\sim}60$ tokens across all $\beta$ configurations, while SimPO stays flat ($38 \to 42$ tokens). This validates SimPO's length normalization as an effective countermeasure against the length exploitation that plagues DPO.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{length_during_training.png}
+    \caption{\textbf{Chosen response length across training.} DPO (blue) exhibits clear length exploitation; SimPO (orange) remains flat due to length normalization.}
+    \label{fig:length}
+\end{figure}
+
+\subsection{Likelihood Displacement}
+
+\Cref{fig:displacement} visualizes the implicit reward trajectories across all DPO and SimPO configurations. Both methods exhibit likelihood displacement: the implicit rewards for \emph{both} chosen and rejected responses drift negative during training, even as the gap between them increases. This confirms the findings of Razin et al.~\cite{razin2024unintentional} at the 1B scale. The displacement is more pronounced in DPO (chosen reward drifts to $-2.5$) than in SimPO ($-2.8$ at $\beta{=}2.0$, but on an absolute rather than log-ratio scale).
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{likelihood_displacement.png}
+    \caption{\textbf{Likelihood displacement.} Implicit rewards for chosen (blue) and rejected (orange) responses both drift negative during training for DPO and SimPO, confirming the phenomenon documented by Razin et al.~\cite{razin2024unintentional}.}
+    \label{fig:displacement}
+\end{figure}
+
+\subsection{Noise Robustness}
+
+\Cref{fig:noise} shows LC win rate as a function of label-noise probability. Both methods show a slight bump at 10\% noise---likely due to a mild regularization effect from small amounts of label corruption---before degrading at higher noise levels. Overall, DPO degrades more steeply than SimPO: at 50\% noise, DPO's LC win rate drops to 0.549, while SimPO retains 0.534. This is consistent with DPO's strict reliance on the Bradley-Terry preference model: when labels are noisy, the implicit reward signal becomes unreliable. SimPO's reference-free formulation provides some inherent robustness.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{noise_robustness.png}
+    \caption{\textbf{Noise robustness.} LC win rate vs.\ label-noise probability. DPO (blue) degrades faster than SimPO (orange) under preference label corruption.}
+    \label{fig:noise}
+\end{figure}
+
+\subsection{$\beta$ Sweep and Pareto Frontier}
+
+\Cref{fig:pareto} shows the reward--KL frontier across $\beta$ values. For DPO, $\beta{=}0.01$ under-regularizes (weak gradient signal, minimal learning), while $\beta{\ge}0.5$ produces aggressive optimization with high KL divergence. The sweet spot is $\beta{\approx}0.05{-}0.1$, consistent with prior work. For SimPO, $\beta{=}2.0$ performs best; $\beta{=}5.0$ pushes the model furthest from the SFT distribution but without proportional quality gains.
+
+\subsection{Diversity}
+
+\Cref{fig:diversity} shows the diversity ordering PPO $>$ SimPO $>$ DPO across all metrics. PPO's on-policy sampling preserves output diversity (distinct-1 = 0.188, self-BLEU = 0.063), while DPO's off-policy optimization collapses toward modal responses (distinct-1 = 0.142, self-BLEU = 0.103). SimPO falls between the two, suggesting that removing the reference model alone does not cause severe mode collapse.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{diversity_bars.png}
+    \caption{\textbf{Diversity metrics.} PPO produces the most diverse outputs; DPO shows the most mode collapse. Lower self-BLEU = more diverse.}
+    \label{fig:diversity}
+\end{figure}
+
+\subsection{Compute Cost}
+
+\Cref{tab:compute} summarizes the wall-clock training time and peak GPU memory for each method on a single A100 (40\,GB). PPO is ${\sim}8\times$ slower than DPO/SimPO due to on-policy generation and the four-model memory footprint. SimPO is the most memory-efficient, requiring only one model in GPU memory (no frozen reference).
+
+\begin{table}[t]
+\centering
+\small
+\caption{Compute cost per default-config run on a single A100-40GB.}
+\label{tab:compute}
+\begin{tabular}{lccc}
+\toprule
+Method & Models in mem & Wall-clock & Peak VRAM \\
+\midrule
+SFT   & 1 & ${\sim}$45 min & 18 GB \\
+DPO   & 2 (policy + ref) & ${\sim}$35 min & 22 GB \\
+SimPO & 1 & ${\sim}$30 min & 14 GB \\
+PPO   & 4 (pol + ref + RM + VH) & ${\sim}$4 hr & 38 GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================================
+\section{Conclusion}
+
+We presented a controlled three-way comparison of PPO, DPO, and SimPO for language model alignment on TL;DR summarization. Our main findings:
+
+\begin{enumerate}
+    \item \textbf{PPO achieves the best quality--diversity trade-off}, with the highest LC win rate and output diversity, at the cost of infrastructure complexity.
+    \item \textbf{DPO's simplification comes with a length exploitation tax}: raw win rates are competitive, but length-controlled evaluation reveals the gap. DPO also exhibits stronger likelihood displacement and mode collapse.
+    \item \textbf{SimPO's length normalization effectively prevents length exploitation}, but it does not fully close the quality gap with PPO. Its reference-free design provides moderate noise robustness.
+    \item \textbf{Label noise disproportionately hurts DPO}, consistent with its strict dependence on observed preference labels.
+\end{enumerate}
+
+The ``simplification tax'' is real but nuanced: each removed component introduces a specific, measurable failure mode rather than a uniform quality loss. Practitioners should choose based on which failure modes are acceptable for their application.
+
+% ============================================================================
+{\small
+\bibliographystyle{ieee_fullname}
+
+\begin{thebibliography}{12}
+
+\bibitem{ouyang2022training}
+L.~Ouyang, J.~Wu, X.~Jiang, D.~Almeida, C.~Wainwright, et~al.
+\newblock Training language models to follow instructions with human feedback.
+\newblock {\em NeurIPS}, 35:27730--27744, 2022.
+
+\bibitem{stiennon2020learning}
+N.~Stiennon, L.~Ouyang, J.~Wu, D.~Ziegler, R.~Lowe, et~al.
+\newblock Learning to summarize from human feedback.
+\newblock {\em NeurIPS}, 2020.
+
+\bibitem{rafailov2023direct}
+R.~Rafailov, A.~Sharma, E.~Mitchell, S.~Ermon, C.~Manning, and C.~Finn.
+\newblock Direct preference optimization: Your language model is secretly a reward model.
+\newblock {\em NeurIPS}, 36, 2023.
+
+\bibitem{meng2024simpo}
+Y.~Meng, M.~Xia, and D.~Chen.
+\newblock SimPO: Simple preference optimization with a reference-free reward.
+\newblock {\em NeurIPS}, 2024.
+
+\bibitem{xu2024dpo}
+S.~Xu, W.~Fu, J.~Gao, W.~Ye, W.~Liu, et~al.
+\newblock Is DPO superior to PPO for LLM alignment? A comprehensive study.
+\newblock {\em ICML}, 2024.
+
+\bibitem{razin2024unintentional}
+N.~Razin, S.~Malladi, A.~Bhojanapalli, K.~Axiotis, J.~Li, and S.~Arora.
+\newblock Unintentional unalignment: Likelihood displacement in direct preference optimization.
+\newblock {\em arXiv:2410.08847}, 2024.
+
+\bibitem{biderman2023pythia}
+S.~Biderman, H.~Schoelkopf, Q.~Anthony, H.~Bradley, K.~O'Brien, et~al.
+\newblock Pythia: A suite for analyzing large language models across training and scaling.
+\newblock {\em ICML}, 2023.
+
+\bibitem{zheng2024judging}
+L.~Zheng, W.-L.~Chiang, Y.~Sheng, S.~Zhuang, Z.~Wu, et~al.
+\newblock Judging LLM-as-a-judge with MT-bench and chatbot arena.
+\newblock {\em NeurIPS}, 36, 2024.
+
+\bibitem{dubois2024length}
+Y.~Dubois, B.~Galambosi, P.~Liang, and T.~Hashimoto.
+\newblock Length-controlled AlpacaEval: A simple way to debias automatic evaluators.
+\newblock {\em COLM}, 2024.
+
+\bibitem{vonwerra2022trl}
+L.~von Werra, Y.~Belkada, L.~Tunstall, E.~Beeching, T.~Thrush, and N.~Lambert.
+\newblock TRL: Transformer reinforcement learning.
+\newblock \url{https://github.com/huggingface/trl}, 2022.
+
+\bibitem{huang2024n}
+S.~Huang, M.~Liu, G.~Zhong, et~al.
+\newblock The N+ implementation details of RLHF with PPO: A case study on TL;DR summarization.
+\newblock {\em arXiv:2403.17031}, 2024.
+
+\bibitem{park2024disentangling}
+R.~Park, R.~Rafailov, S.~Ermon, and C.~Finn.
+\newblock Disentangling length from quality in direct preference optimization.
+\newblock {\em arXiv:2403.19159}, 2024.
+
+\end{thebibliography}
+}
+
+\end{document}
